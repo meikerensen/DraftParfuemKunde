@@ -1,0 +1,41 @@
+name: Dashboard aktualisieren
+
+on:
+  schedule:
+    - cron: "0 6 * * 1" # jeden Montag 06:00 UTC
+  workflow_dispatch: {} # zusätzlich manuell startbar über den "Run workflow"-Button
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Neueste Excel-Dateien von ClickUp holen
+        run: node scripts/fetch-source-files.js
+        env:
+          CLICKUP_TOKEN: ${{ secrets.CLICKUP_TOKEN }}
+          CLICKUP_TEAM_ID: ${{ secrets.CLICKUP_TEAM_ID }}
+          CLICKUP_TASK_UEBERSICHT: ${{ secrets.CLICKUP_TASK_UEBERSICHT }}
+          CLICKUP_TASK_GPSR_ISSUE: ${{ secrets.CLICKUP_TASK_GPSR_ISSUE }}
+          CLICKUP_TASK_GPSR_GRAPH: ${{ secrets.CLICKUP_TASK_GPSR_GRAPH }}
+          CLICKUP_TASK_PROHIBITED: ${{ secrets.CLICKUP_TASK_PROHIBITED }}
+
+      - name: Dashboard neu generieren
+        run: node generate.js
+
+      - name: Änderungen committen und pushen
+        run: |
+          # GitHub Pages liest index.html aus dem Repo-Root (Settings -> Pages
+          # -> branch main, path /), generate.js schreibt aber nach dist/ -
+          # deshalb hier ins Root kopieren, bevor committet wird.
+          cp dist/index.html index.html
+          git config user.name "dashboard-bot"
+          git config user.email "actions@users.noreply.github.com"
+          git add index.html
+          git diff --staged --quiet && echo "Keine Änderungen." || git commit -m "Automatisches Dashboard-Update ($(date -u +%Y-%m-%d))"
+          git push
