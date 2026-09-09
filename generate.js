@@ -47,6 +47,79 @@ function excelDateToISO(v) {
   const epoch = Date.UTC(1899, 11, 30);
   return new Date(epoch + n * 86400000).toISOString().slice(0, 10);
 }
+// Parses either an Excel serial-date number (xlsx source) or German-locale
+// date text (CSV source). Found necessary because Google's xlsx export
+// silently blanks cells containing short-format date text like "14.8" (day.
+// month, no year) - confirmed by comparing an xlsx export against a CSV
+// export of the same tab taken minutes apart: the CSV had the text, the
+// xlsx cell was empty. Full "D.M.YYYY"/"D.M.YY" text is also handled for
+// completeness, though those survive the xlsx export fine.
+//
+// Short dates have no year at all - most rows in the New Listings tab use
+// this format, and the last row with an actual year anywhere is from
+// January 2025. A naive "assume current year" is provably wrong: it
+// produced entries like "01.10" -> 2026-10-01, a date in the future
+// relative to a snapshot taken 2026-09-01, on a row already marked "done" -
+// a completed task can't be dated in the future. Since these rows are
+// entered in roughly chronological order and the tracker spans a year
+// boundary, the fix is to prefer the current year but roll back to the
+// previous year whenever the current-year reading would land after the
+// snapshot date. This can't perfectly recover the true year for old
+// entries buried deep in 2024/2025 history (there's no year marker left to
+// check against for those), but it guarantees no date is ever shown in the
+// future, and it's correct for anything near the actual year boundary,
+// which is what matters for the "recent" figures.
+function parseFlexibleDate(v, snapshotISO) {
+  const serial = excelDateToISO(v);
+  if (serial) return serial;
+  const s = String(v == null ? "" : v).trim();
+  if (!s) return null;
+  let m = s.match(/^(\d{1,2})\.(\d{1,2})\.(\d{4})$/);
+  if (m) return `${m[3]}-${m[2].padStart(2, "0")}-${m[1].padStart(2, "0")}`;
+  m = s.match(/^(\d{1,2})\.(\d{1,2})\.(\d{2})$/);
+  if (m) return `20${m[3]}-${m[2].padStart(2, "0")}-${m[1].padStart(2, "0")}`;
+  m = s.match(/^(\d{1,2})\.(\d{1,2})\.?$/);
+  if (m) {
+    const day = m[1].padStart(2, "0"), month = m[2].padStart(2, "0");
+    const thisYear = new Date().getUTCFullYear();
+    let iso = `${thisYear}-${month}-${day}`;
+    if (snapshotISO && iso > snapshotISO) iso = `${thisYear - 1}-${month}-${day}`;
+    return iso;
+  }
+  return null;
+}
+// Minimal RFC4180-ish CSV parser (semicolon-delimited, Google Sheets CSV
+// export style) - handles quoted fields with "" escaping and embedded
+// semicolons/newlines. Returns the same row-array-with-.rowNum shape as
+// xlsx-lite's getRows(), so downstream code doesn't care which format a
+// given tab actually came from.
+function parseCsvSemicolon(text) {
+  const rows = [];
+  let row = [], field = "", inQuotes = false, i = 0;
+  const pushField = () => { row.push(field); field = ""; };
+  const pushRow = () => { pushField(); rows.push(row); row = []; };
+  while (i < text.length) {
+    const c = text[i];
+    if (inQuotes) {
+      if (c === '"') {
+        if (text[i + 1] === '"') { field += '"'; i += 2; continue; }
+        inQuotes = false; i++; continue;
+      }
+      field += c; i++; continue;
+    }
+    if (c === '"') { inQuotes = true; i++; continue; }
+    if (c === ";") { pushField(); i++; continue; }
+    if (c === "\r") { i++; continue; }
+    if (c === "\n") { pushRow(); i++; continue; }
+    field += c; i++;
+  }
+  if (field !== "" || row.length) pushRow();
+  return rows.map((cells, idx) => {
+    const arr = cells.slice();
+    arr.rowNum = idx + 1;
+    return arr;
+  });
+}
 function hasContent(rowArr) {
   return rowArr.some((v) => String(v == null ? "" : v).trim() !== "");
 }
@@ -91,8 +164,25 @@ function statusToken(label) {
   return "neutral";
 }
 
-const notes = []; // data-quality notes collected while building, rendered at the bottom
-function note(text) { notes.push(text); }
+// SNAPSHOT_NOW is frozen at generation time and embedded into the page, both
+// for the server-rendered initial numbers AND the client-side day-window
+// selector. If the browser recomputed "now" at view time instead, the same
+// page would show different numbers depending on when you happened to open
+// it - a "weekly snapshot" needs one fixed reference date, not a live clock.
+// Declared early (before any date parsing happens) so parseFlexibleDate can
+// use it to reject impossible future dates.
+const SNAPSHOT_NOW = new Date();
+const SNAPSHOT_ISO = SNAPSHOT_NOW.toISOString().slice(0, 10);
+
+const notes = []; // data-quality notes collected while building, rendered at the bottom (internal only - not shown on the page)
+function note(de, en) { notes.push({ de, en }); }
+// Inline bilingual label: German on the main line, English rendered smaller
+// underneath via CSS (.en). Used for every static UI string - headings,
+// legends, table headers, tags - never for raw data values (product names,
+// reasons, comments), which stay exactly as the source sheet has them.
+function bi(de, en) {
+  return `${esc(de)}<span class="en">${esc(en)}</span>`;
+}
 
 // ============================================================================
 // 1) UEBERSICHTSTABELLE
@@ -100,10 +190,20 @@ function note(text) { notes.push(text); }
 const ueb = loadWorkbook(path.join(DATA_DIR, "uebersicht.xlsx"));
 
 // --- 3. New Listings ---------------------------------------------------
-const nlRows = ueb.getRows("3. New Listings").filter((r) => r.rowNum > 3 && hasContent(r));
+// Prefer a CSV export of this one tab over the xlsx workbook's copy, if
+// present: the xlsx export was found to silently blank cells with
+// short-format date text (see parseFlexibleDate above), which the CSV
+// export preserves correctly. Same column layout either way, so only the
+// row source and date parser differ.
+const nlCsvPath = path.join(DATA_DIR, "new-listings.csv");
+const nlUsingCsv = fs.existsSync(nlCsvPath);
+const nlSourceRows = nlUsingCsv
+  ? parseCsvSemicolon(fs.readFileSync(nlCsvPath, "utf8"))
+  : ueb.getRows("3. New Listings");
+const nlRows = nlSourceRows.filter((r) => r.rowNum > 3 && hasContent(r));
 const newListings = nlRows.map((r) => ({
   rowNum: r.rowNum,
-  date: excelDateToISO(r[2]),
+  date: parseFlexibleDate(r[2], SNAPSHOT_ISO),
   country: r[3] || null,
   account: normalizeAccount(r[4]) || scanForAccount(r), // col4 is the labeled Account col; some rows have it shifted by merged cells
   ean: r[5] || null,
@@ -125,13 +225,6 @@ const nlDates = newListings.map((x) => x.date).filter(Boolean).sort();
 // Listings" + a day count, which would imply recent creation that the data
 // doesn't support.
 const NL_RECENT_DAYS = 30;
-// SNAPSHOT_NOW is frozen at generation time and embedded into the page, both
-// for the server-rendered initial numbers AND the client-side day-window
-// selector. If the browser recomputed "now" at view time instead, the same
-// page would show different numbers depending on when you happened to open
-// it - a "weekly snapshot" needs one fixed reference date, not a live clock.
-const SNAPSHOT_NOW = new Date();
-const SNAPSHOT_ISO = SNAPSHOT_NOW.toISOString().slice(0, 10);
 const nlCutoffISO = new Date(SNAPSHOT_NOW.getTime() - NL_RECENT_DAYS * 86400000).toISOString().slice(0, 10);
 const nlLatestDateISO = nlDates[nlDates.length - 1] || null;
 const nlDaysSinceLatest = nlLatestDateISO ? Math.floor((SNAPSHOT_NOW - new Date(nlLatestDateISO)) / 86400000) : null;
@@ -140,25 +233,45 @@ const nlRecentByAccount = countBy(newListingsRecent, (x) => x.account || "Nicht 
 const nlByStatusRecent = countBy(newListingsRecent, (x) => x.status || "(kein Status)");
 const totalNewListingsRecent = newListingsRecent.length;
 
+if (nlUsingCsv) {
+  note(
+    `„Bearbeitete Listings" liest ab jetzt aus einer separaten CSV-Datei dieses einen Tabs statt aus der xlsx-Gesamtdatei — Grund: der xlsx-Export von Google Sheets leert Zellen mit kurzem Datumstext ohne Jahr (z. B. „14.8") kommentarlos, während der CSV-Export denselben Text korrekt enthält. Verifiziert durch Vergleich beider Exportformate für dieselbe Tabelle, Minuten auseinander erstellt. ` +
+    `Kurze Datumsangaben ohne Jahr nehmen das aktuelle Jahr an, außer das würde ein Datum NACH dem Snapshot-Stand ergeben (z. B. wurde „01.10" fälschlich als Zukunftsdatum erkannt), dann wird ein Jahr zurückgerechnet. Für vereinzelte alte Einträge tief in der Historie kann das Jahr dadurch trotzdem ungenau sein — für die „letzte X Tage"-Werte oben ist das jedoch korrekt, da es genau den Jahreswechsel behandelt.`,
+    `"Processed Listings" now reads from a separate CSV export of this one tab instead of the xlsx workbook — reason: Google Sheets' xlsx export silently blanks cells with short date text lacking a year (e.g. "14.8"), while the CSV export preserves that text correctly. Verified by comparing both export formats of the same tab, taken minutes apart. ` +
+    `Short dates with no year are assumed to be the current year, unless that would land the date AFTER the snapshot date (e.g. "01.10" was initially misread as a future date), in which case it falls back one year. This can still be imprecise for scattered old entries deep in the history, but it's correct for the "last X days" figures above, since it specifically handles the year boundary.`
+  );
+}
 note(
   `Die Kachel heißt „Bearbeitete Listings" statt „New Listings", weil die Datumsspalte im Quell-Tab kein Erstellungsdatum ist, sondern das Datum des letzten Bearbeitungs-/Prüf-Durchgangs — ` +
   `die Datumswerte häufen sich auf wenige Einzeltage (Batch-Reviews eines bestehenden Rückstands), und die zuletzt bearbeiteten Zeilen haben meist keinen Produktnamen. ` +
-  `Die Kommentare („still under processing, check later") beschreiben Nachverfolgung, keine Neuanlage.`
+  `Die Kommentare („still under processing, check later") beschreiben Nachverfolgung, keine Neuanlage.`,
+  `The tile is called "Processed Listings" instead of "New Listings" because the date column in the source sheet is not a creation date, but the date of the last processing/review pass — ` +
+  `the date values cluster on a handful of single days (batch reviews of an existing backlog), and the most recently touched rows usually have no product name. ` +
+  `The comments ("still under processing, check later") describe follow-up, not new creation.`
 );
 note(
   `„Bearbeitete Listings" zeigt die letzten ${NL_RECENT_DAYS} Tage (ab ${nlCutoffISO}): ${totalNewListingsRecent} Einträge. ` +
   `Lifetime-Gesamtzahl (alle Zeilen seit Beginn der Tabelle, unverändert verfügbar): ${newListings.length}, davon ${nlRows.length - nlDates.length} ohne verwertbares Datum (fließen nicht in den 30-Tage-Wert ein). ` +
   (nlDaysSinceLatest !== null
     ? `Der Tracker wurde zuletzt am ${nlLatestDateISO} befüllt (vor ${nlDaysSinceLatest} Tagen) — ein niedriger Wert kann auch schlicht heißen, dass die Tabelle seither nicht bearbeitet wurde.`
+    : ""),
+  `"Processed Listings" shows the last ${NL_RECENT_DAYS} days (from ${nlCutoffISO}): ${totalNewListingsRecent} entries. ` +
+  `Lifetime total (all rows since the tracker began, still available): ${newListings.length}, of which ${nlRows.length - nlDates.length} have no usable date (excluded from the ${NL_RECENT_DAYS}-day figure). ` +
+  (nlDaysSinceLatest !== null
+    ? `The tracker was last updated on ${nlLatestDateISO} (${nlDaysSinceLatest} days ago) — a low figure can simply mean the table hasn't been touched since, not that nothing happened.`
     : "")
 );
 note(
   `${nlByAccount["Nicht zuordenbar (Quelle unvollständig)"] || 0} Zeilen in „New Listings" (Lifetime-Gesamtzahl) konnten keinem Account zugeordnet werden ` +
-  `(verbundene/verschobene Zellen in der Quelltabelle liefern dort Zahlen-Müll statt „parfum-direct"/„Parfum Store" — Quelldatenproblem, kein Skript-Bug).`
+  `(verbundene/verschobene Zellen in der Quelltabelle liefern dort Zahlen-Müll statt „parfum-direct"/„Parfum Store" — Quelldatenproblem, kein Skript-Bug).`,
+  `${nlByAccount["Nicht zuordenbar (Quelle unvollständig)"] || 0} rows in "New Listings" (lifetime total) could not be matched to an account ` +
+  `(merged/shifted cells in the source table return number junk there instead of "parfum-direct"/"Parfum Store" — a source-data issue, not a script bug).`
 );
 note(
   `Alle Zahlen auf dieser Seite sind ein eingefrorener Wochenstand („Stand: ${SNAPSHOT_ISO}") — die Tages-Fenster (7/14/30/60/90 Tage) rechnen relativ zu diesem Datum, nicht zur Uhrzeit beim Betrachten. ` +
-  `Erst der nächste Lauf von generate.js aktualisiert den Stand.`
+  `Erst der nächste Lauf von generate.js aktualisiert den Stand.`,
+  `All figures on this page are a frozen weekly snapshot ("as of: ${SNAPSHOT_ISO}") — the day windows (7/14/30/60/90 days) are calculated relative to this date, not to the time you're viewing the page. ` +
+  `Only the next run of generate.js will update the snapshot.`
 );
 // Compact date+account+status payload for the client-side day-window selector
 // below - only what's needed to recompute counts in the browser.
@@ -201,11 +314,14 @@ const blockedAsins = blockedRows.map((r) => ({
 const blockedByStatus = countBy(blockedAsins, (x) => x.status || "(kein Status)");
 const blockedByReason = countBy(blockedAsins, (x) => x.reason || "(kein Grund)");
 note(
-  `In „Blocked ASINs" wurden die Schreibvarianten „Lillial" und „Lilial" (${(blockedAsins.filter((x) => x.reason === "Lilial").length)} Zeilen zusammen) als ein Grund gezählt — offensichtlicher Tippfehler in der Quelle, keine zwei unterschiedlichen Gründe.`
+  `In „Blocked ASINs" wurden die Schreibvarianten „Lillial" und „Lilial" (${(blockedAsins.filter((x) => x.reason === "Lilial").length)} Zeilen zusammen) als ein Grund gezählt — offensichtlicher Tippfehler in der Quelle, keine zwei unterschiedlichen Gründe.`,
+  `In "Blocked ASINs", the spelling variants "Lillial" and "Lilial" (${(blockedAsins.filter((x) => x.reason === "Lilial").length)} rows combined) were counted as one reason — an obvious typo in the source, not two different reasons.`
 );
 note(
   `In diesem Export war in „Blocked ASINs" eine zusätzliche Spalte eingefügt, wodurch Product/Reason/Stock/Status um eine Position verschoben waren (Reason zeigte kurzzeitig Produktnamen statt Gründen). ` +
-  `Behoben durch Spalten-Erkennung über die Kopfzeile statt feste Positionen — bleibt auch bei künftigen Spaltenverschiebungen in dieser Tabelle korrekt.`
+  `Behoben durch Spalten-Erkennung über die Kopfzeile statt feste Positionen — bleibt auch bei künftigen Spaltenverschiebungen in dieser Tabelle korrekt.`,
+  `In this export, an extra column had been inserted in "Blocked ASINs", shifting Product/Reason/Stock/Status one position over (Reason briefly showed product names instead of reasons). ` +
+  `Fixed via header-based column detection instead of fixed positions — stays correct even if this table's columns shift again in future exports.`
 );
 
 // --- 2. Account Violations -------------------------------------------------
@@ -242,19 +358,23 @@ const gpsrCases = gpsrRawAll
 const gpsrTemplateRowCount = gpsrRawAll.filter((r) => r.rowNum > 2).length - gpsrCases.length;
 note(
   `„GPSR"/„Lilial"/„GPSR-Graph" sind in der Übersichtstabelle drei Tabs mit identischem Inhalt — ` +
-  `dieses Skript liest nur „GPSR" einmal, um Drei-fach-Zählung zu vermeiden.`
+  `dieses Skript liest nur „GPSR" einmal, um Drei-fach-Zählung zu vermeiden.`,
+  `"GPSR"/"Lilial"/"GPSR-Graph" are three tabs with identical content in the overview workbook — ` +
+  `this script reads only "GPSR" once, to avoid triple-counting.`
 );
 note(
   `Von ${gpsrRawAll.filter((r) => r.rowNum > 2).length} physischen Zeilen im GPSR-Tab enthalten nur ${gpsrCases.length} tatsächlich einen Fall (Order Nr. gefüllt); ` +
-  `${gpsrTemplateRowCount} sind leere Vorlagenzeilen und zählen hier bewusst NICHT als „offener Fall".`
+  `${gpsrTemplateRowCount} sind leere Vorlagenzeilen und zählen hier bewusst NICHT als „offener Fall".`,
+  `Of ${gpsrRawAll.filter((r) => r.rowNum > 2).length} physical rows in the GPSR tab, only ${gpsrCases.length} actually hold a case (Order Nr. filled in); ` +
+  `${gpsrTemplateRowCount} are empty template rows and are deliberately NOT counted here as an "open case".`
 );
 const gpsrByFlag = countBy(gpsrCases, (x) => x.flag || "(kein Flag)");
 
-// Market coverage for the GPSR case log: both accounts are demonstrably
-// active in FR/UK/NL too (see Blocked ASINs / Account Violations), so a "0"
-// for markets missing from this specific tab would misleadingly read as "no
-// complaints" instead of "not tracked here".
-const GPSR_STANDARD_MARKETS = ["DE", "FR", "UK", "IT", "ES", "NL"];
+// Market coverage for the GPSR case log: restricted to DE per client request
+// (01.09.) - note this means the table below no longer sums to the "GPSR
+// cases (real order rows)" KPI card total further up (which still counts
+// IT/ES cases too, since that total isn't scoped to this table).
+const GPSR_STANDARD_MARKETS = ["DE"];
 const gpsrCasesByMarket = countBy(gpsrCases, (x) => x.marketplace || "(kein Markt)");
 const gpsrMarketCoverage = GPSR_STANDARD_MARKETS.map((mkt) => ({
   market: mkt,
@@ -262,8 +382,10 @@ const gpsrMarketCoverage = GPSR_STANDARD_MARKETS.map((mkt) => ({
   tracked: (gpsrCasesByMarket[mkt] || 0) > 0,
 }));
 note(
-  `Für Märkte ohne Eintrag in der GPSR-Fall-Tabelle wird „keine Daten in dieser Quelle" ausgewiesen statt „0 Fälle" — beide Accounts sind in mehreren dieser Märkte nachweislich aktiv ` +
-  `(siehe Blocked ASINs/Account Violations), ein „0" würde das falsch als „keine Beschwerden" lesen lassen.`
+  `„GPSR-Fälle nach Markt" zeigt seit dem 01.09. auf Kundenwunsch nur noch DE — IT (4 Fälle) und ES (9 Fälle) haben in der Quelle reale erfasste Fälle, werden hier aber bewusst ausgeblendet. ` +
+  `Die KPI-Kachel „GPSR-Fälle (echte Order-Zeilen)" oben zählt weiterhin alle Märkte zusammen (26) — die beiden Zahlen stimmen deshalb absichtlich nicht mehr überein.`,
+  `"GPSR cases by market" has shown DE only since 01.09. per client request — IT (4 cases) and ES (9 cases) have real tracked cases in the source but are deliberately hidden here. ` +
+  `The "GPSR cases (real order rows)" KPI card above still counts all markets combined (26) — the two numbers are intentionally inconsistent as a result.`
 );
 
 // ============================================================================
@@ -321,7 +443,9 @@ function revenueStats(items) {
 const revSummary = revenueStats(gpsrPriority);
 note(
   `Revenue-Summe wird als echte Zahlensumme berechnet, nicht als Text verkettet. ` +
-  `${revSummary.junkCount} Zeile(n) hatten einen nicht-numerischen Revenue-Wert (z. B. "#N/A") und wurden ausgeschlossen; ${revSummary.blankCount} Zeilen hatten schlicht keinen Revenue-Wert eingetragen (normal, kein Fehler).`
+  `${revSummary.junkCount} Zeile(n) hatten einen nicht-numerischen Revenue-Wert (z. B. "#N/A") und wurden ausgeschlossen; ${revSummary.blankCount} Zeilen hatten schlicht keinen Revenue-Wert eingetragen (normal, kein Fehler).`,
+  `The revenue total is calculated as a true numeric sum, not concatenated as text. ` +
+  `${revSummary.junkCount} row(s) had a non-numeric revenue value (e.g. "#N/A") and were excluded; ${revSummary.blankCount} rows simply had no revenue value entered (normal, not an error).`
 );
 const revenueByAccount = {};
 for (const acc of ["Parfum Direct", "Parfum Store"]) {
@@ -335,7 +459,9 @@ const submissionStatusCounts = countBy(gpsrPriority, (x) => x.submissionStatus |
 if (priorityStatusJunkCount > 0) {
   note(
     `${priorityStatusJunkCount} Zeilen in den GPSR-Priority-Sheets hatten eine reine Zahl statt eines echten Status in der Submission-Status-Spalte ` +
-    `(dieselbe Art von verschobener Zelle wie bei „New Listings") — diese werden als „(kein Status)" statt als Fantasie-Statuswert gezählt.`
+    `(dieselbe Art von verschobener Zelle wie bei „New Listings") — diese werden als „(kein Status)" statt als Fantasie-Statuswert gezählt.`,
+    `${priorityStatusJunkCount} rows in the GPSR priority sheets had a plain number instead of a real status in the submission-status column ` +
+    `(the same kind of shifted cell as in "New Listings") — these are counted as "(no status)" instead of a made-up status value.`
   );
 }
 
@@ -382,7 +508,10 @@ const weeklyTrend = weeklyRaw
 note(
   `„Numbers per week" enthält rechts von der Wochentabelle weitere, uneindeutig ausgerichtete Mini-Tabellen (u. a. tägliche „Anzahl offener Fälle") — ` +
   `diese wurden NICHT übernommen, da die Spaltenausrichtung ohne Rückfrage beim Original-Ersteller nicht zuverlässig rekonstruierbar war. ` +
-  `Nur der eindeutige Wochenblock (Approved/Submitted/New GPSR SKUs je Account) ist im Trend enthalten (${weeklyTrend.length} Wochen insgesamt).`
+  `Nur der eindeutige Wochenblock (Approved/Submitted/New GPSR SKUs je Account) ist im Trend enthalten (${weeklyTrend.length} Wochen insgesamt).`,
+  `"Numbers per week" contains further, ambiguously-aligned mini-tables to the right of the weekly table (among others a daily "number of open cases") — ` +
+  `these were NOT included, since the column alignment could not be reliably reconstructed without asking the original author. ` +
+  `Only the unambiguous weekly block (Approved/Submitted/New GPSR SKUs per account) is included in the trend (${weeklyTrend.length} weeks total).`
 );
 // Chart shows roughly the last 2 months. The sheet has no per-period exact
 // date, only "YYYY.MM.<sub-period>" labels with an uneven number of
@@ -394,7 +523,8 @@ note(
 const WEEKLY_TREND_RECENT_COUNT = 8;
 const weeklyTrendRecent = weeklyTrend.slice(-WEEKLY_TREND_RECENT_COUNT);
 note(
-  `Der Trend-Graph zeigt die letzten ${weeklyTrendRecent.length} von ${weeklyTrend.length} Wochen (≈ 2 Monate bei der Wochentaktung dieser Tabelle) — die komplette Historie steht weiterhin in der einklappbaren Detailtabelle darunter.`
+  `Der Trend-Graph zeigt die letzten ${weeklyTrendRecent.length} von ${weeklyTrend.length} Wochen (≈ 2 Monate bei der Wochentaktung dieser Tabelle) — die komplette Historie steht weiterhin in der einklappbaren Detailtabelle darunter.`,
+  `The trend chart shows the last ${weeklyTrendRecent.length} of ${weeklyTrend.length} weeks (≈ 2 months at this table's weekly cadence) — the full history is still available in the collapsible detail table below.`
 );
 
 // ============================================================================
@@ -447,10 +577,13 @@ prohibited = prohibited.filter((p) => {
 });
 note(
   `Die Inhaltsstoff-Liste kommt jetzt als xlsx-Workbook (2 Tabs) statt CSV. „Sheet1" hat dieselbe Spaltenstruktur wie die bisherige CSV-Quelle und wird gelesen; ` +
-  `„Sheet3" ist eine kaputte Zweitversion (Account-Spalte enthält Zahlen statt Namen, Titel-Spalte leer) — verifiziert: nur 1 von 431 IDs dort fehlt in Sheet1, wird ignoriert.`
+  `„Sheet3" ist eine kaputte Zweitversion (Account-Spalte enthält Zahlen statt Namen, Titel-Spalte leer) — verifiziert: nur 1 von 431 IDs dort fehlt in Sheet1, wird ignoriert.`,
+  `The prohibited-ingredients list now arrives as an xlsx workbook (2 tabs) instead of a CSV. "Sheet1" has the same column layout as the previous CSV source and is read; ` +
+  `"Sheet3" is a broken duplicate (Account column holds numbers instead of names, Title column is empty) — verified: only 1 of 431 IDs there is missing from Sheet1, ignored.`
 );
 note(
-  `Liste „Verbotene Inhaltsstoffe (Lilial/Lyral)": ${prohibited.length} Einträge nach Entfernen von ${piDupes} exakten Duplikat-Zeilen. ${prohibited.filter((p) => p.eanOnly).length} Einträge haben nur eine EAN, keine ASIN.`
+  `Liste „Verbotene Inhaltsstoffe (Lilial/Lyral)": ${prohibited.length} Einträge nach Entfernen von ${piDupes} exakten Duplikat-Zeilen. ${prohibited.filter((p) => p.eanOnly).length} Einträge haben nur eine EAN, keine ASIN.`,
+  `"Prohibited ingredients (Lilial/Lyral)" list: ${prohibited.length} entries after removing ${piDupes} exact duplicate rows. ${prohibited.filter((p) => p.eanOnly).length} entries have only an EAN, no ASIN.`
 );
 const piByAccount = countBy(prohibited, (x) => x.account || "(kein Account)");
 const piByStatus = countBy(prohibited, (x) => x.status);
@@ -466,17 +599,89 @@ for (const a of piAsins) {
 }
 note(
   `Von ${piAsins.size} eindeutigen ASINs in der Inhaltsstoff-Liste stehen ${piAlsoBlocked} zusätzlich auch in „Blocked ASINs" und ${piAlsoInPriority} in den GPSR-Priority-Listen — ` +
-  `plausibel, da Lilial/Lyral-Fälle oft auch Deaktivierungen/GPSR-Fälle auslösen.`
+  `plausibel, da Lilial/Lyral-Fälle oft auch Deaktivierungen/GPSR-Fälle auslösen.`,
+  `Of ${piAsins.size} unique ASINs in the prohibited-ingredients list, ${piAlsoBlocked} also appear in "Blocked ASINs" and ${piAlsoInPriority} in the GPSR priority lists — ` +
+  `plausible, since Lilial/Lyral cases often also trigger deactivations/GPSR cases.`
 );
+
+// ============================================================================
+// 5) BRAND APPROVALS — Parfum Direct only (confirmed by the client), no
+// date column, so it's shown as its own section rather than folded into
+// an existing one, but styled/labelled as Parfum-Direct-scoped like every
+// other account-specific number in this dashboard.
+// ============================================================================
+// Cells are free text, not a fixed enum ("Approved", "Approved, request
+// approval-sell yours", "most are active, for the others not accepting
+// applications", "Cant submit application", "didnt find products with this
+// brandname or EANs" all appear) - categorizeBrandStatus() buckets by
+// keyword, most-specific phrase first, and falls back to showing the raw
+// text verbatim rather than guessing a bucket for anything unrecognized.
+function categorizeBrandStatus(raw) {
+  const v = (raw || "").toString().trim();
+  if (!v) return { token: "neutral", label: "Keine Angabe", labelEn: "Not specified" };
+  if (looksNumericJunk(v)) return { token: "neutral", label: "Dateneintrag unklar", labelEn: "Unclear data entry" };
+  const s = v.toLowerCase();
+  if (s.includes("cant submit") || s.includes("can't submit") || s.includes("cannot submit")) {
+    return { token: "critical", label: "Nicht möglich", labelEn: "Not possible" };
+  }
+  if (s.includes("didnt find") || s.includes("didn't find") || s.includes("did not find")) {
+    return { token: "neutral", label: "Keine Produkte gefunden", labelEn: "No products found" };
+  }
+  if (s.includes("not accepting applications") || (s.includes("approved") && s.includes("others"))) {
+    return { token: "warn", label: "Teilweise aktiv", labelEn: "Partially active" };
+  }
+  if (s.includes("submitted")) {
+    return { token: "warn", label: "Eingereicht", labelEn: "Submitted" };
+  }
+  if (s.includes("approved")) {
+    return { token: "good", label: "Freigegeben", labelEn: "Approved" };
+  }
+  return { token: "neutral", label: v, labelEn: v };
+}
+const ba = loadWorkbook(path.join(DATA_DIR, "brand-approvals.xlsx"));
+const baHeaderRow = ba.getRows("Sheet1").find((r) => r.rowNum === 1) || [];
+// Market columns read from the header row itself (not a fixed list) - same
+// header-based approach used for "4. Blocked ASINs" after that sheet's
+// column-drift incident, so a future reordering here won't silently
+// misalign brand names with the wrong marketplace.
+const BRAND_MARKETS = baHeaderRow.slice(1).map((h) => (h || "").trim()).filter(Boolean);
+const baDataRows = ba.getRows("Sheet1").filter((r) => r.rowNum > 1 && hasContent(r));
+const brandApprovals = baDataRows
+  .filter((r) => (r[0] || "").trim())
+  .map((r) => ({
+    brand: r[0].trim(),
+    cells: BRAND_MARKETS.map((mkt, i) => ({ market: mkt, raw: (r[i + 1] || "").toString(), ...categorizeBrandStatus(r[i + 1]) })),
+  }));
+const allBaCells = brandApprovals.flatMap((b) => b.cells).filter((c) => c.raw.trim() !== "");
+const baCategoryMap = new Map();
+for (const c of allBaCells) {
+  if (!baCategoryMap.has(c.label)) baCategoryMap.set(c.label, { label: c.label, labelEn: c.labelEn, token: c.token, count: 0 });
+  baCategoryMap.get(c.label).count++;
+}
+const baCategoryEntries = [...baCategoryMap.values()].sort((a, b) => b.count - a.count);
+const baJunkCount = allBaCells.filter((c) => looksNumericJunk(c.raw)).length;
+note(
+  `„Status of brand approvals" ist eine neue Quelle (Marke × Marktplatz-Freigabestatus) und gilt laut Kunde ausschließlich für Parfum Direct — ohne Datumsspalte wird sie deshalb als eigener, aber Parfum-Direct-gekennzeichneter Überblick dargestellt statt in eine bestehende Sektion eingerechnet.`,
+  `"Status of brand approvals" is a new source (brand × marketplace approval status) that, per the client, applies exclusively to Parfum Direct — with no date column, it's shown as its own section but labelled/styled as Parfum-Direct-scoped rather than folded into an existing section.`
+);
+if (baJunkCount > 0) {
+  note(
+    `${baJunkCount} Zelle(n) in „Status of brand approvals" enthielten eine reine Zahl statt eines Freigabe-Status (z. B. „12", „14") — vermutlich ein Dateneingabefehler in der Quelle, wie schon bei früheren Status-Spalten in diesem Dashboard. Als „Dateneintrag unklar" statt als Fantasie-Status gezählt.`,
+    `${baJunkCount} cell(s) in "Status of brand approvals" contained a plain number instead of an approval status (e.g. "12", "14") — likely a data-entry error in the source, the same pattern seen in earlier status columns in this dashboard. Counted as "Unclear data entry" instead of a made-up status.`
+  );
+}
 
 // ============================================================================
 // RENDER
 // ============================================================================
+// headers: array of [german, english] pairs
 function accountTable(headers, rowsHtml) {
-  return `<table><thead><tr>${headers.map((h) => `<th>${esc(h)}</th>`).join("")}</tr></thead><tbody>${rowsHtml}</tbody></table>`;
+  return `<table><thead><tr>${headers.map(([de, en]) => `<th>${bi(de, en)}</th>`).join("")}</tr></thead><tbody>${rowsHtml}</tbody></table>`;
 }
 // Plain single-colour bar list - for free-text categorical breakdowns
 // (reasons, flags, types) where there's no inherent "progress" to encode.
+// Category labels (k) come straight from the source data, so they stay
+// untranslated - only the surrounding UI chrome is bilingual.
 function barHtml(entries, total) {
   return entries
     .map(([k, v]) => {
@@ -490,7 +695,7 @@ function barHtml(entries, total) {
 // status token (good/warn/critical/neutral), plus a chip legend underneath.
 function segBarHtml(entries, total) {
   if (!entries.length || !total) {
-    return `<div class="seg-bar"></div><p style="color:var(--ink-faint); font-size:.8rem; margin:4px 0 0;">Keine Einträge im gewählten Zeitraum.</p>`;
+    return `<div class="seg-bar"></div><p style="color:var(--ink-faint); font-size:.8rem; margin:4px 0 0;">${bi("Keine Einträge im gewählten Zeitraum.", "No entries in the selected period.")}</p>`;
   }
   const segs = entries
     .map(([k, v]) => {
@@ -506,6 +711,29 @@ function segBarHtml(entries, total) {
     .join("");
   return `<div class="seg-bar">${segs}</div><div class="seg-legend">${legend}</div>`;
 }
+// Like segBarHtml, but for entries whose colour token is already known
+// (categorizeBrandStatus decides it up front from free text) rather than
+// guessed from the label text - segBarHtml's own statusToken() only
+// recognises English workflow words and would mis-colour German labels
+// like "Freigegeben"/"Nicht möglich".
+function brandStatusBarHtml(entries, total) {
+  if (!entries.length || !total) {
+    return `<div class="seg-bar"></div><p style="color:var(--ink-faint); font-size:.8rem; margin:4px 0 0;">${bi("Keine Einträge.", "No entries.")}</p>`;
+  }
+  const segs = entries
+    .map((e) => {
+      const pct = ((e.count / total) * 100).toFixed(2);
+      return `<div style="width:${pct}%; background:var(--${e.token});" title="${esc(e.label)}"></div>`;
+    })
+    .join("");
+  const legend = entries
+    .map((e) => {
+      const pct = ((e.count / total) * 100).toFixed(1);
+      return `<span><i style="background:var(--${e.token});"></i>${bi(e.label, e.labelEn)} · ${fmtInt(e.count)} (${pct}%)</span>`;
+    })
+    .join("");
+  return `<div class="seg-bar">${segs}</div><div class="seg-legend">${legend}</div>`;
+}
 function accentClass(account) {
   return account === "Parfum Direct" ? "acc-pd" : account === "Parfum Store" ? "acc-ps" : "";
 }
@@ -517,9 +745,14 @@ function shortPeriod(period) {
 // Minimal dependency-free SVG line chart - two series (e.g. Approved vs
 // Submitted), sharing one y-scale, with a dot + native <title> tooltip per
 // data point so exact values are available on hover without cluttering the
-// chart itself with numbers.
-function lineChartSvg(periods, series) {
-  const W = 560, H = 170, padL = 34, padR = 10, padT = 12, padB = 24;
+// chart itself with numbers. Axis titles (bilingual, matching the rest of
+// the dashboard) make explicit what the two axes represent, since the
+// gridline numbers alone don't say "SKUs" or "week" - a client glancing at
+// the chart shouldn't have to guess.
+function lineChartSvg(periods, series, axisLabels) {
+  const yLabel = (axisLabels && axisLabels.y) || ["Anzahl SKUs", "Number of SKUs"];
+  const xLabel = (axisLabels && axisLabels.x) || ["Woche", "Week"];
+  const W = 560, H = 195, padL = 46, padR = 10, padT = 12, padB = 40;
   const plotW = W - padL - padR, plotH = H - padT - padB;
   const n = periods.length;
   const allVals = series.flatMap((s) => s.values).filter((v) => v !== null && v !== undefined);
@@ -531,12 +764,24 @@ function lineChartSvg(periods, series) {
     return `<line x1="${padL}" y1="${yy.toFixed(1)}" x2="${W - padR}" y2="${yy.toFixed(1)}" stroke="var(--line)" stroke-width="1"/>` +
       `<text x="${padL - 6}" y="${(yy + 3).toFixed(1)}" font-size="8" text-anchor="end" fill="var(--ink-faint)">${fmtInt(Math.round(f * maxV))}</text>`;
   }).join("");
+  const xLabelsY = padT + plotH + 10;
   const xLabels = periods
     .map((p, i) => {
       if (n > 10 && i % 2 === 1) return ""; // thin out labels when there are many weeks
-      return `<text x="${x(i).toFixed(1)}" y="${H - 6}" font-size="8" text-anchor="middle" fill="var(--ink-faint)">${esc(shortPeriod(p))}</text>`;
+      return `<text x="${x(i).toFixed(1)}" y="${xLabelsY.toFixed(1)}" font-size="8" text-anchor="middle" fill="var(--ink-faint)">${esc(shortPeriod(p))}</text>`;
     })
     .join("");
+  // Y-axis title, rotated -90deg and vertically centred on the plot area.
+  // Both languages sit on one rotated baseline (continuing along the same
+  // line rather than stacked underneath), since stacking rotated text needs
+  // a second independently-rotated <text> anyway and this is simpler to get
+  // right without visual round-tripping.
+  const cy = (padT + plotH / 2).toFixed(1);
+  const yAxisTitle = `<text x="11" y="${cy}" font-size="8" text-anchor="middle" fill="var(--ink-faint)" transform="rotate(-90 11 ${cy})"><tspan>${esc(yLabel[0])}</tspan><tspan dx="6" font-style="italic">${esc(yLabel[1])}</tspan></text>`;
+  // X-axis title, two stacked lines below the period tick labels.
+  const xAxisTitleY1 = padT + plotH + 23, xAxisTitleY2 = padT + plotH + 33;
+  const xAxisTitle = `<text x="${(padL + plotW / 2).toFixed(1)}" y="${xAxisTitleY1}" font-size="8" text-anchor="middle" fill="var(--ink-faint)">${esc(xLabel[0])}</text>` +
+    `<text x="${(padL + plotW / 2).toFixed(1)}" y="${xAxisTitleY2}" font-size="8" font-style="italic" text-anchor="middle" fill="var(--ink-faint)">${esc(xLabel[1])}</text>`;
   const seriesSvg = series
     .map((s) => {
       const pts = s.values.map((v, i) => (v === null || v === undefined ? null : [x(i), y(v)]));
@@ -551,7 +796,7 @@ function lineChartSvg(periods, series) {
       return `<path d="${pathD}" fill="none" stroke="${s.color}" stroke-width="2"/>${dots}`;
     })
     .join("");
-  return `<svg viewBox="0 0 ${W} ${H}" style="width:100%; height:auto; max-width:${W}px; display:block;">${gridY}${seriesSvg}${xLabels}</svg>`;
+  return `<svg viewBox="0 0 ${W} ${H}" style="width:100%; height:auto; max-width:${W}px; display:block;">${gridY}${seriesSvg}${xLabels}${yAxisTitle}${xAxisTitle}</svg>`;
 }
 function chartLegend(series) {
   return `<div class="seg-legend" style="margin-top:4px;">${series
@@ -639,6 +884,11 @@ code{ background:var(--panel-2); padding:2px 5px; border-radius:3px; font-family
 .tag{ display:inline-block; padding:2px 9px; border-radius:20px; font-size:.7rem; font-weight:600; }
 .tag.tracked{ background:var(--good-soft); color:var(--good); }
 .tag.gap{ background:var(--line); color:var(--ink-soft); }
+.tag.t-good{ background:var(--good-soft); color:var(--good); }
+.tag.t-warn{ background:var(--warn-soft); color:var(--warn); }
+.tag.t-critical{ background:var(--critical-soft); color:var(--critical); }
+.tag.t-neutral{ background:var(--neutral-soft); color:var(--neutral); }
+.brand-table td{ white-space:nowrap; }
 .coverage-note{ font-size:.8rem; color:var(--ink-soft); margin-top:10px; }
 select#nlDaysSelect{ font:inherit; font-family:var(--font-mono); background:var(--panel); border:1px solid var(--line-strong); border-radius:3px; padding:1px 6px; color:var(--ink); }
 footer{ color:var(--ink-faint); font-size:.75rem; margin-top:48px; }
@@ -662,46 +912,64 @@ details.pi-table summary::before{ content:"▸"; color:var(--ink-faint); font-si
 details.pi-table[open] summary::before{ content:"▾"; }
 details.pi-table summary::-webkit-details-marker{ display:none; }
 @media (max-width:640px){ .bar-label{ width:140px; } }
+.en{ display:block; font-weight:400; font-style:italic; color:var(--ink-faint); text-transform:none; letter-spacing:normal; }
+h1 .en{ font-size:.5rem; margin-top:2px; }
+h2 .en{ font-size:.62rem; margin-top:2px; }
+h3 .en{ font-size:.72rem; margin-top:1px; }
+.card .lbl .en, .acc-stat-grid .lbl .en{ font-size:.92em; margin-top:1px; }
+.legend .en, .coverage-note .en{ font-size:.95em; margin-top:2px; }
+th .en{ font-size:.9em; margin-top:2px; text-transform:none; letter-spacing:normal; }
+.badge .en, .tag .en{ display:block; font-size:.85em; margin-top:0; }
+.jumpnav a .en{ font-size:.85em; margin-top:1px; }
+.group-title .en{ display:inline; font-size:.85em; margin-top:0; margin-left:6px; font-weight:500; }
+.stand-chip .en{ font-size:.85em; margin-top:1px; }
+.bar-label .en{ font-size:.85em; margin-top:1px; }
+.notes li .en{ font-size:.92em; margin-top:2px; }
+footer .en{ font-size:.9em; margin-top:2px; }
+summary .en{ font-size:.85em; margin-top:1px; font-weight:400; }
 </style>
 </head>
 <body>
 <div class="wrap">
 <header class="top">
-  <h1>Parfum Compliance Dashboard</h1>
-  <span class="stand-chip" id="standChip">Stand: ${SNAPSHOT_ISO}</span>
+  <h1>Parfum Compliance Dashboard<span class="en">Parfum Compliance Dashboard</span></h1>
+  <span class="stand-chip" id="standChip">${bi(`Stand: ${SNAPSHOT_ISO}`, `As of: ${SNAPSHOT_ISO}`)}</span>
 </header>
-<p class="sub">Generiert aus Übersichtstabelle, GPSR-Issue-Workbook, GPSR-Graph-Workbook und der Prohibited-Ingredients-Liste. Alle Zeitfenster (7–90 Tage) rechnen relativ zum <b>eingefrorenen Stand</b> oben, nicht zur Uhrzeit beim Betrachten — siehe „Daten-Hinweise" ganz unten für alle Korrekturen und Annahmen.</p>
+<p class="sub">${bi(
+  `Generiert aus Übersichtstabelle, GPSR-Issue-Workbook, GPSR-Graph-Workbook, der Prohibited-Ingredients-Liste und der Markenfreigaben-Liste. Alle Zeitfenster (7–90 Tage) rechnen relativ zum eingefrorenen Stand oben, nicht zur Uhrzeit beim Betrachten.`,
+  `Generated from the overview workbook, the GPSR issue workbook, the GPSR graph workbook, the prohibited-ingredients list, and the brand approvals list. All time windows (7–90 days) are calculated relative to the frozen snapshot date above, not to the time you're viewing the page.`
+)}</p>
 <div class="jumpnav">
-  <a href="#sec-overview">Überblick</a>
-  <a href="#sec-gpsr">GPSR-Compliance</a>
-  <a href="#sec-violations">Blocked ASINs &amp; Violations</a>
-  <a href="#sec-ingredients">Verbotene Inhaltsstoffe</a>
-  <a href="#sec-notes">Daten-Hinweise</a>
+  <a href="#sec-overview">${bi("Überblick", "Overview")}</a>
+  <a href="#sec-gpsr">${bi("GPSR-Compliance", "GPSR Compliance")}</a>
+  <a href="#sec-violations">${bi("Blocked ASINs & Violations", "Blocked ASINs & Violations")}</a>
+  <a href="#sec-ingredients">${bi("Verbotene Inhaltsstoffe", "Prohibited Ingredients")}</a>
+  <a href="#sec-brands">${bi("Markenfreigaben (PD)", "Brand Approvals (PD)")}</a>
 </div>
 
 <div class="group" id="sec-overview">
-<p class="group-title">Überblick</p>
+<p class="group-title">${bi("Überblick", "Overview")}</p>
 <section>
-<h2>Snapshot</h2>
-<p class="legend"><b>Die vier wichtigsten Zahlen</b> auf einen Blick — Details und Herkunft in den Sektionen darunter.</p>
+<h2>${bi("Snapshot", "Snapshot")}</h2>
+<p class="legend">${bi("Die vier wichtigsten Zahlen auf einen Blick — Details und Herkunft in den Sektionen darunter.", "The four key numbers at a glance — details and source in the sections below.")}</p>
 <div class="grid">
   <div class="card">
     <strong id="nlCount">${fmtInt(totalNewListingsRecent)}</strong>
-    <div class="lbl">Bearbeitete Listings (letzte <select id="nlDaysSelect">
+    <div class="lbl">${bi("Bearbeitete Listings", "Processed Listings")} (${bi("letzte", "last")} <select id="nlDaysSelect">
       <option value="7">7</option><option value="14">14</option><option value="30" selected>30</option><option value="60">60</option><option value="90">90</option>
-    </select> Tage)</div>
-    <small id="nlBreakdown">${sortedEntries(nlRecentByAccount).map(([k, v]) => `${esc(k)}: ${fmtInt(v)}`).join(" · ") || "keine im Zeitraum"} · ab ${nlCutoffISO}</small>
-    <small>Lifetime gesamt: ${fmtInt(totalNewListings)}${nlDaysSinceLatest !== null ? ` · Tracker zuletzt aktualisiert vor ${nlDaysSinceLatest} Tagen (${esc(nlLatestDateISO)})` : ""}</small>
+    </select> ${bi("Tage", "days")})</div>
+    <small id="nlBreakdown">${sortedEntries(nlRecentByAccount).map(([k, v]) => `${esc(k)}: ${fmtInt(v)}`).join(" · ") || "keine im Zeitraum / none in this period"} · ab / from ${nlCutoffISO}</small>
+    <small>${bi(`Lifetime gesamt: ${fmtInt(totalNewListings)}${nlDaysSinceLatest !== null ? ` · Tracker zuletzt aktualisiert vor ${nlDaysSinceLatest} Tagen (${nlLatestDateISO})` : ""}`, `Lifetime total: ${fmtInt(totalNewListings)}${nlDaysSinceLatest !== null ? ` · tracker last updated ${nlDaysSinceLatest} days ago (${nlLatestDateISO})` : ""}`)}</small>
   </div>
-  <div class="card"><strong>${fmtInt(totalGpsrCases)}</strong><div class="lbl">GPSR-Fälle (echte Order-Zeilen)</div><small>vs. ${fmtInt(gpsrTemplateRowCount)} leere Vorlagenzeilen ausgeschlossen · nur DE/ES/IT erfasst</small></div>
-  <div class="card"><strong>${fmtEUR(totalRevenue)}</strong><div class="lbl">Revenue (letzte 12 Monate, PD+PS)</div><small>Parfum Direct: ${fmtEUR(revenueByAccount["Parfum Direct"].sum)} · Parfum Store: ${fmtEUR(revenueByAccount["Parfum Store"].sum)}</small></div>
-  <div class="card"><strong>${fmtInt(totalProhibited)}</strong><div class="lbl">Verbotene Inhaltsstoffe (Lilial/Lyral)</div><small>${sortedEntries(piByAccount).map(([k, v]) => `${esc(k)}: ${fmtInt(v)}`).join(" · ")}</small></div>
+  <div class="card"><strong>${fmtInt(totalGpsrCases)}</strong><div class="lbl">${bi("GPSR-Fälle (echte Order-Zeilen)", "GPSR cases (real order rows)")}</div><small>${bi(`vs. ${fmtInt(gpsrTemplateRowCount)} leere Vorlagenzeilen ausgeschlossen · nur DE/ES/IT erfasst`, `vs. ${fmtInt(gpsrTemplateRowCount)} empty template rows excluded · only DE/ES/IT tracked`)}</small></div>
+  <div class="card"><strong>${fmtEUR(totalRevenue)}</strong><div class="lbl">${bi("Revenue (letzte 12 Monate, PD+PS)", "Revenue (last 12 months, PD+PS)")}</div><small>Parfum Direct: ${fmtEUR(revenueByAccount["Parfum Direct"].sum)} · Parfum Store: ${fmtEUR(revenueByAccount["Parfum Store"].sum)}</small></div>
+  <div class="card"><strong>${fmtInt(totalProhibited)}</strong><div class="lbl">${bi("Verbotene Inhaltsstoffe (Lilial/Lyral)", "Prohibited ingredients (Lilial/Lyral)")}</div><small>${sortedEntries(piByAccount).map(([k, v]) => `${esc(k)}: ${fmtInt(v)}`).join(" · ")}</small></div>
 </div>
 </section>
 
 <section>
-<h2>Account-Übersicht</h2>
-<p class="legend"><b>Die vier wichtigsten Kennzahlen je Account</b> — GPSR-Fälle, verbotene Inhaltsstoffe (Lilial), bearbeitete Listings und Umsatz.</p>
+<h2>${bi("Account-Übersicht", "Account Overview")}</h2>
+<p class="legend">${bi("Die vier wichtigsten Kennzahlen je Account — GPSR-Fälle, verbotene Inhaltsstoffe (Lilial), bearbeitete Listings und Umsatz.", "The four key metrics per account — GPSR cases, prohibited ingredients (Lilial), processed listings, and revenue.")}</p>
 <div class="grid" style="grid-template-columns:repeat(auto-fit,minmax(280px,1fr));">
 ${["Parfum Direct", "Parfum Store"]
   .map((acc) => {
@@ -709,12 +977,12 @@ ${["Parfum Direct", "Parfum Store"]
     return `<div class="card acc-card ${accentClass(acc)}">
       <div class="acc-card-head"><span class="badge ${acc === "Parfum Direct" ? "pd" : "ps"}">${esc(acc)}</span></div>
       <div class="acc-stat-grid">
-        <div><strong>${fmtInt(gpsrN)}</strong><div class="lbl">GPSR-Fälle</div></div>
-        <div><strong>${fmtInt(piByAccount[acc] || 0)}</strong><div class="lbl">Verbotene Inhaltsstoffe (Lilial)</div></div>
-        <div><strong data-nl-account="${esc(acc)}">${fmtInt(nlRecentByAccount[acc] || 0)}</strong><div class="lbl">Bearb. Listings (${NL_RECENT_DAYS}d)</div></div>
-        <div><strong>${fmtEUR(revenueByAccount[acc].sum)}</strong><div class="lbl">Revenue (12M)</div></div>
+        <div><strong>${fmtInt(gpsrN)}</strong><div class="lbl">${bi("GPSR-Fälle", "GPSR cases")}</div></div>
+        <div><strong>${fmtInt(piByAccount[acc] || 0)}</strong><div class="lbl">${bi("Verbotene Inhaltsstoffe (Lilial)", "Prohibited ingredients (Lilial)")}</div></div>
+        <div><strong data-nl-account="${esc(acc)}">${fmtInt(nlRecentByAccount[acc] || 0)}</strong><div class="lbl">${bi(`Bearb. Listings (${NL_RECENT_DAYS}d)`, `Processed listings (${NL_RECENT_DAYS}d)`)}</div></div>
+        <div><strong>${fmtEUR(revenueByAccount[acc].sum)}</strong><div class="lbl">${bi("Revenue (12M)", "Revenue (12M)")}</div></div>
       </div>
-      <small>Produkte mit Umsatz: ${fmtInt(productsWithRevenueByAccount[acc] || 0)}</small>
+      <small>${bi(`Produkte mit Umsatz: ${fmtInt(productsWithRevenueByAccount[acc] || 0)}`, `Products with revenue: ${fmtInt(productsWithRevenueByAccount[acc] || 0)}`)}</small>
     </div>`;
   })
   .join("")}
@@ -723,43 +991,49 @@ ${["Parfum Direct", "Parfum Store"]
 </div>
 
 <div class="group" id="sec-gpsr">
-<p class="group-title">GPSR-Compliance</p>
+<p class="group-title">${bi("GPSR-Compliance", "GPSR Compliance")}</p>
 <section>
-<h2 id="nlStatusHeading">Bearbeitete Listings — Status-Verteilung (letzte ${NL_RECENT_DAYS} Tage)</h2>
-<p class="legend">Bearbeitungsstand der im gewählten Zeitraum zuletzt geprüften Listing-Zeilen — <b>kein Neuanlage-Datum</b> (siehe Daten-Hinweise unten).</p>
+<h2 id="nlStatusHeading">${bi(`Bearbeitete Listings — Status-Verteilung (letzte ${NL_RECENT_DAYS} Tage)`, `Processed Listings — status breakdown (last ${NL_RECENT_DAYS} days)`)}</h2>
+<p class="legend">${bi("Bearbeitungsstand der im gewählten Zeitraum zuletzt geprüften Listing-Zeilen — kein Neuanlage-Datum.", "Processing status of the listing rows most recently reviewed in the selected period — not a creation date.")}</p>
 <div id="nlStatusBars">${segBarHtml(sortedEntries(nlByStatusRecent), totalNewListingsRecent)}</div>
 </section>
 
 <section>
-<h2>GPSR-Fälle nach Markt — Datenabdeckung</h2>
-<p class="legend">Zeigt, für welche Märkte überhaupt Fälle in dieser Quelle erfasst werden — <b>„–" bedeutet Datenlücke</b>, nicht „keine Beschwerden".</p>
+<h2>${bi("GPSR-Fälle nach Markt — Datenabdeckung", "GPSR cases by market — data coverage")}</h2>
+<p class="legend">${bi(`Zeigt, für welche Märkte überhaupt Fälle in dieser Quelle erfasst werden — „–" bedeutet Datenlücke, nicht „keine Beschwerden".`, `Shows which markets have cases tracked in this source at all — "–" means a data gap, not "no complaints".`)}</p>
 ${accountTable(
-  ["Markt", "Fälle", "Status"],
+  [["Markt", "Market"], ["Fälle", "Cases"], ["Status", "Status"]],
   gpsrMarketCoverage
     .map(
       (m) =>
-        `<tr><td>${esc(m.market)}</td><td>${m.tracked ? fmtInt(m.cases) : "–"}</td><td>${m.tracked ? '<span class="tag tracked">erfasst</span>' : '<span class="tag gap">keine Daten in dieser Quelle</span>'}</td></tr>`
+        `<tr><td>${esc(m.market)}</td><td>${m.tracked ? fmtInt(m.cases) : "–"}</td><td>${m.tracked ? `<span class="tag tracked">${bi("erfasst", "tracked")}</span>` : `<span class="tag gap">${bi("keine Daten in dieser Quelle", "no data in this source")}</span>`}</td></tr>`
     )
     .join("")
 )}
-<p class="coverage-note">Für Märkte ohne Eintrag oben liegen in der GPSR-Fall-Tabelle keine Zeilen vor — das ist eine Lücke in der Datenerhebung, kein Beleg für weniger Beschwerden.</p>
+<p class="coverage-note">${bi("Für Märkte ohne Eintrag oben liegen in der GPSR-Fall-Tabelle keine Zeilen vor — das ist eine Lücke in der Datenerhebung, kein Beleg für weniger Beschwerden.", "For markets with no entry above, the GPSR case table has no rows — this is a gap in data collection, not evidence of fewer complaints.")}</p>
 </section>
 
 <section>
-<h2>GPSR-Fälle nach Ursache (Flag)</h2>
-<p class="legend">Beschwerdegrund laut Amazon-Seller-Central-Case (siehe Datenabdeckung oben).</p>
+<h2>${bi("GPSR-Fälle nach Ursache (Flag)", "GPSR cases by cause (flag)")}</h2>
+<p class="legend">${bi("Beschwerdegrund laut Amazon-Seller-Central-Case (siehe Datenabdeckung oben).", "Complaint reason per the Amazon Seller Central case (see data coverage above).")}</p>
 ${barHtml(sortedEntries(gpsrByFlag).slice(0, 12), totalGpsrCases)}
 </section>
 
 <section>
-<h2>GPSR-Priority-Einreichungen — Status</h2>
-<p class="legend">Bearbeitungsstand der bei Amazon eingereichten GPSR-Fälle (Priority-Listen), beide Accounts zusammen.</p>
+<h2>${bi("GPSR-Priority-Einreichungen — Status", "GPSR priority submissions — status")}</h2>
+<p class="legend">${bi(
+  `Bearbeitungsstand der bei Amazon eingereichten GPSR-Fälle (Priority-Listen), beide Accounts zusammen. „Approved" = Details eingereicht und von Amazon bereits genehmigt. „Submitted" = Details eingereicht, aber von Amazon noch nicht genehmigt oder abgelehnt.`,
+  `Processing status of GPSR cases submitted to Amazon (priority lists), both accounts combined. "Approved" = details submitted and already approved by Amazon. "Submitted" = details submitted, but not yet approved or declined by Amazon.`
+)}</p>
 ${segBarHtml(sortedEntries(submissionStatusCounts), totalPriorityEntries)}
 </section>
 
 <section>
-<h2>Wöchentlicher GPSR-Trend</h2>
-<p class="legend">Approved- vs. Submitted-Verlauf der letzten 2 Monate, getrennt nach Account — <b>Punkte zeigen den genauen Wert beim Überfahren mit der Maus</b>.</p>
+<h2>${bi("Wöchentlicher GPSR-Trend", "Weekly GPSR trend")}</h2>
+<p class="legend">${bi(
+  `Approved- vs. Submitted-Verlauf der letzten 2 Monate, getrennt nach Account — Punkte zeigen den genauen Wert beim Überfahren mit der Maus. „Approved" = Details eingereicht und von Amazon bereits genehmigt. „Submitted" = Details eingereicht, aber von Amazon noch nicht genehmigt oder abgelehnt.`,
+  `Approved vs. Submitted trend for the last 2 months, split by account — hover over a point to see its exact value. "Approved" = details submitted and already approved by Amazon. "Submitted" = details submitted, but not yet approved or declined by Amazon.`
+)}</p>
 <h3>Parfum Direct</h3>
 ${lineChartSvg(
   weeklyTrendRecent.map((w) => w.period),
@@ -785,9 +1059,9 @@ ${chartLegend([
   { name: "Submitted", color: "var(--warn)" },
 ])}
 <details class="pi-table">
-<summary>Alle ${weeklyTrend.length} Wochen als Tabelle anzeigen</summary>
+<summary>${bi(`Alle ${weeklyTrend.length} Wochen als Tabelle anzeigen`, `Show all ${weeklyTrend.length} weeks as a table`)}</summary>
 ${accountTable(
-  ["Woche", "PD: Approved SKUs", "PD: Submitted SKUs", "PD: Neue GPSR", "PS: Bestand Start", "PS: Approved SKUs", "PS: Submitted SKUs", "PS: Neue GPSR"],
+  [["Woche", "Week"], ["PD: Approved SKUs", "PD: Approved SKUs"], ["PD: Submitted SKUs", "PD: Submitted SKUs"], ["PD: Neue GPSR", "PD: New GPSR"], ["PS: Bestand Start", "PS: Starting stock"], ["PS: Approved SKUs", "PS: Approved SKUs"], ["PS: Submitted SKUs", "PS: Submitted SKUs"], ["PS: Neue GPSR", "PS: New GPSR"]],
   weeklyTrend
     .map(
       (w) =>
@@ -800,40 +1074,40 @@ ${accountTable(
 </div>
 
 <div class="group" id="sec-violations">
-<p class="group-title">Blocked ASINs &amp; Violations</p>
+<p class="group-title">${bi("Blocked ASINs & Violations", "Blocked ASINs & Violations")}</p>
 <section>
-<h2>Blocked ASINs — Status</h2>
-<p class="legend">Aktueller Bearbeitungsstand blockierter Listings, beide Accounts zusammen.</p>
+<h2>${bi("Blocked ASINs — Status", "Blocked ASINs — status")}</h2>
+<p class="legend">${bi("Aktueller Bearbeitungsstand blockierter Listings, beide Accounts zusammen.", "Current processing status of blocked listings, both accounts combined.")}</p>
 ${segBarHtml(sortedEntries(blockedByStatus), blockedAsins.length)}
-<h3>Top-Gründe</h3>
+<h3>${bi("Top-Gründe", "Top reasons")}</h3>
 ${barHtml(sortedEntries(blockedByReason).slice(0, 10), blockedAsins.length)}
 </section>
 
 <section>
-<h2>Account Violations</h2>
-<p class="legend">Verstöße gegen Amazon-Richtlinien nach Bearbeitungsstand und Typ.</p>
+<h2>${bi("Account Violations", "Account Violations")}</h2>
+<p class="legend">${bi("Verstöße gegen Amazon-Richtlinien nach Bearbeitungsstand und Typ.", "Violations of Amazon policy by processing status and type.")}</p>
 ${segBarHtml(sortedEntries(violationsByStatus), violations.length)}
-<h3>Nach Typ</h3>
+<h3>${bi("Nach Typ", "By type")}</h3>
 ${barHtml(sortedEntries(violationsByType).slice(0, 10), violations.length)}
 </section>
 </div>
 
 <div class="group" id="sec-ingredients">
-<p class="group-title">Verbotene Inhaltsstoffe</p>
+<p class="group-title">${bi("Verbotene Inhaltsstoffe", "Prohibited Ingredients")}</p>
 <section>
-<h2>Verbotene Inhaltsstoffe (Lilial/Lyral)</h2>
-<p class="legend"><b>ASINs mit gemeldetem Lilial-/Lyral-Gehalt</b> — eigenständige Compliance-Liste, nicht Teil der GPSR-Fall-Tabelle oben.</p>
+<h2>${bi("Verbotene Inhaltsstoffe (Lilial/Lyral)", "Prohibited ingredients (Lilial/Lyral)")}</h2>
+<p class="legend">${bi("ASINs mit gemeldetem Lilial-/Lyral-Gehalt — eigenständige Compliance-Liste, nicht Teil der GPSR-Fall-Tabelle oben.", "ASINs with reported Lilial/Lyral content — a standalone compliance list, not part of the GPSR case table above.")}</p>
 <div class="grid">
-  <div class="card"><strong>${fmtInt(totalProhibited)}</strong><div class="lbl">Einträge gesamt</div></div>
-  <div class="card"><strong>${fmtInt(piAsins.size)}</strong><div class="lbl">Eindeutige ASINs</div></div>
-  <div class="card"><strong>${fmtInt(prohibited.filter((p) => p.eanOnly).length)}</strong><div class="lbl">Nur EAN, keine ASIN</div></div>
+  <div class="card"><strong>${fmtInt(totalProhibited)}</strong><div class="lbl">${bi("Einträge gesamt", "Total entries")}</div></div>
+  <div class="card"><strong>${fmtInt(piAsins.size)}</strong><div class="lbl">${bi("Eindeutige ASINs", "Unique ASINs")}</div></div>
+  <div class="card"><strong>${fmtInt(prohibited.filter((p) => p.eanOnly).length)}</strong><div class="lbl">${bi("Nur EAN, keine ASIN", "EAN only, no ASIN")}</div></div>
 </div>
-<h3>Status-Verteilung</h3>
+<h3>${bi("Status-Verteilung", "Status breakdown")}</h3>
 ${barHtml(sortedEntries(piByStatus), totalProhibited)}
 <details class="pi-table">
-<summary>Erste 30 Einträge anzeigen</summary>
+<summary>${bi("Erste 30 Einträge anzeigen", "Show first 30 entries")}</summary>
 ${accountTable(
-  ["#", "Account", "ASIN/EAN", "Produkt", "Status", "Fehlende Unterlagen", "Case ID"],
+  [["#", "#"], ["Account", "Account"], ["ASIN/EAN", "ASIN/EAN"], ["Produkt", "Product"], ["Status", "Status"], ["Fehlende Unterlagen", "Missing documents"], ["Case ID", "Case ID"]],
   prohibited
     .slice(0, 30)
     .map(
@@ -846,15 +1120,39 @@ ${accountTable(
 </section>
 </div>
 
-<section id="sec-notes">
-<h2>Daten-Hinweise</h2>
-<p class="legend"><b>Jede Korrektur, Annahme oder Datenlücke</b> in diesem Dashboard, zum Nachvollziehen.</p>
-<div class="notes"><ul>
-${notes.map((n) => `<li>${esc(n)}</li>`).join("")}
-</ul></div>
+<div class="group" id="sec-brands">
+<p class="group-title">${bi("Markenfreigaben", "Brand Approvals")}</p>
+<section class="acc-card acc-pd" style="padding-left:14px;">
+<h2>${bi("Markenfreigaben nach Marktplatz", "Brand approvals by marketplace")} <span class="badge pd">Parfum Direct</span></h2>
+<p class="legend">${bi("Gilt laut Kunde ausschließlich für Parfum Direct — keine Datumsspalte in der Quelle, deshalb als eigener Überblick statt in eine bestehende Sektion eingerechnet. Zellen zeigen den Originaltext beim Überfahren mit der Maus.", "Per the client, this applies exclusively to Parfum Direct — no date column in the source, so it's shown as its own overview rather than folded into an existing section. Hover a cell to see the original wording.")}</p>
+<div class="grid">
+  <div class="card"><strong>${fmtInt(brandApprovals.length)}</strong><div class="lbl">${bi("Marken erfasst", "Brands tracked")}</div></div>
+  <div class="card"><strong>${fmtInt(BRAND_MARKETS.length)}</strong><div class="lbl">${bi("Marktplätze", "Marketplaces")}</div></div>
+  <div class="card"><strong>${fmtInt(allBaCells.length)}</strong><div class="lbl">${bi("Ausgefüllte Zellen gesamt", "Filled cells total")}</div></div>
+</div>
+<h3>${bi("Verteilung über alle Zellen", "Breakdown across all cells")}</h3>
+${brandStatusBarHtml(baCategoryEntries, allBaCells.length)}
+<h3>${bi("Übersicht je Marke", "Overview by brand")}</h3>
+<div style="overflow-x:auto;">
+${accountTable(
+  [["Marke", "Brand"], ...BRAND_MARKETS.map((m) => [m, m])],
+  brandApprovals
+    .map(
+      (b) =>
+        `<tr><td>${esc(b.brand)}</td>${b.cells
+          .map((c) => `<td><span class="tag t-${c.token}" title="${esc(c.raw || "(leer)")}">${esc(c.label)}</span></td>`)
+          .join("")}</tr>`
+    )
+    .join("")
+).replace("<table>", '<table class="brand-table">')}
+</div>
 </section>
+</div>
 
-<footer>Generiert von generate.js — Stand ${SNAPSHOT_ISO} — Quellen: Übersichtstabelle.xlsx, Parfum Direct products with GPSR issue.xlsx, GPSR Graph.xlsx, List of ASINs containing prohibited ingredients.xlsx</footer>
+<footer>${bi(
+  `Generiert von generate.js — Stand ${SNAPSHOT_ISO} — Quellen: Übersichtstabelle.xlsx, Parfum Direct products with GPSR issue.xlsx, GPSR Graph.xlsx, List of ASINs containing prohibited ingredients.xlsx, Status of brand approvals.xlsx`,
+  `Generated by generate.js — as of ${SNAPSHOT_ISO} — sources: Übersichtstabelle.xlsx, Parfum Direct products with GPSR issue.xlsx, GPSR Graph.xlsx, List of ASINs containing prohibited ingredients.xlsx, Status of brand approvals.xlsx`
+)}</footer>
 </div>
 <script>
 (function () {
@@ -877,7 +1175,7 @@ ${notes.map((n) => `<li>${esc(n)}</li>`).join("")}
     var entries = Object.keys(counts).map(function (k) { return [k, counts[k]]; });
     entries.sort(function (a, b) { return b[1] - a[1]; });
     if (!entries.length || !total) {
-      return '<div class="seg-bar"></div><p style="color:var(--ink-faint); font-size:.8rem; margin:4px 0 0;">Keine Einträge im gewählten Zeitraum.</p>';
+      return '<div class="seg-bar"></div><p style="color:var(--ink-faint); font-size:.8rem; margin:4px 0 0;">Keine Einträge im gewählten Zeitraum.<span class="en">No entries in the selected period.</span></p>';
     }
     var segs = entries.map(function (e) {
       var pct = ((e[1] / total) * 100).toFixed(2);
@@ -910,8 +1208,9 @@ ${notes.map((n) => `<li>${esc(n)}</li>`).join("")}
     if (ps) parts.push("Parfum Store: " + fmtIntJs(ps));
     if (other) parts.push("Nicht zuordenbar: " + fmtIntJs(other));
     document.getElementById("nlCount").textContent = fmtIntJs(total);
-    document.getElementById("nlBreakdown").textContent = (parts.join(" · ") || "keine im Zeitraum") + " · ab " + cutoff;
-    document.getElementById("nlStatusHeading").textContent = "Bearbeitete Listings — Status-Verteilung (letzte " + days + " Tage)";
+    document.getElementById("nlBreakdown").textContent = (parts.join(" · ") || "keine im Zeitraum / none in this period") + " · ab / from " + cutoff;
+    document.getElementById("nlStatusHeading").innerHTML = "Bearbeitete Listings — Status-Verteilung (letzte " + days + " Tage)" +
+      '<span class="en">Processed Listings — status breakdown (last ' + days + ' days)</span>';
     document.getElementById("nlStatusBars").innerHTML = renderSegBar(statusCounts, total);
     var pdCell = document.querySelector('[data-nl-account="Parfum Direct"]');
     var psCell = document.querySelector('[data-nl-account="Parfum Store"]');
@@ -937,4 +1236,4 @@ console.log("GPSR real cases:", totalGpsrCases, "(template rows excluded:", gpsr
 console.log("Revenue total (fixed):", fmtEUR(totalRevenue), revenueByAccount);
 console.log("Prohibited ingredients:", totalProhibited, piByAccount);
 console.log("\n--- Notes ---");
-notes.forEach((n, i) => console.log(`${i + 1}. ${n}`));
+notes.forEach((n, i) => console.log(`${i + 1}. ${n.de}`));
